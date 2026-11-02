@@ -236,6 +236,52 @@ def drop_conn(url: str) -> None:
     _drop(scheme, host)
 
 
+def content_length(url: str, headers: dict | None = None, ua: str = UA_DESKTOP,
+                   timeout: int = 8) -> int:
+    """探一个地址的字节数，失败返回 0。
+
+    清单里要显示「多大」，但图片/视频的地址是 CDN 直链，只有问一次才知道。
+    先发 `Range: bytes=0-0`：既拿到 `Content-Range: bytes 0-0/<总长>`，
+    又只传回 1 个字节——比 HEAD 稳（不少 CDN 对 HEAD 直接 405），也不预下载。
+    """
+    h = _build_headers(headers, ua)
+    h["Range"] = "bytes=0-0"
+    h["Accept"] = "*/*"
+    h["Accept-Encoding"] = "identity"
+
+    for _hop in range(MAX_REDIRECT + 1):
+        scheme, host, path = _path_of(url)
+        for attempt in (0, 1):
+            conn = _conn(scheme, host, timeout, fresh=bool(attempt))
+            try:
+                conn.request("GET", path, headers=h)
+                resp = conn.getresponse()
+                if resp.status in (301, 302, 303, 307, 308):
+                    where = resp.getheader("Location")
+                    resp.read()
+                    if not where:
+                        return 0
+                    url = urljoin(url, where)
+                    break
+                total = 0
+                crange = resp.getheader("Content-Range") or ""
+                if "/" in crange:
+                    tail = crange.rsplit("/", 1)[-1].strip()
+                    if tail.isdigit():
+                        total = int(tail)
+                if not total:
+                    clen = resp.getheader("Content-Length") or ""
+                    if resp.status == 200 and clen.isdigit():
+                        total = int(clen)
+                resp.read()
+                return total
+            except (http.client.HTTPException, OSError):
+                _drop(scheme, host)
+                if attempt:
+                    return 0
+    return 0
+
+
 def get_bytes(url: str, headers: dict | None = None, ua: str = UA_DESKTOP,
               timeout: int = DEFAULT_TIMEOUT, limit: int = 8 * 1024 * 1024) -> bytes:
     """取原始字节（图片/封面用）。

@@ -111,6 +111,11 @@ def apply_theme(root: tk.Misc) -> ttk.Style:
                     background=ACCENT, bordercolor=GREY1, lightcolor=ACCENT,
                     darkcolor=ACCENT, thickness=6)
 
+    # 预览框里那条「正在解析」的进度条：轨道稍深一点，在白底画布上才看得见
+    style.configure("Parse.Horizontal.TProgressbar", troughcolor="#E3E3E1",
+                    background=ACCENT, bordercolor="#E3E3E1", lightcolor=ACCENT,
+                    darkcolor=ACCENT, thickness=6)
+
     # ---- 滚动条：中性细条
     style.configure("Vertical.TScrollbar", background=GREY2, troughcolor=PAPER,
                     bordercolor=PAPER, arrowcolor=GREY3, width=10, relief="flat")

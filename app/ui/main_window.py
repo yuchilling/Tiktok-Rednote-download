@@ -8,6 +8,7 @@ import subprocess
 import threading
 import webbrowser
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
@@ -163,6 +164,7 @@ class App(tk.Tk):
         self._inflight: set[str] = set()   # 正在下载的缩略图地址，防重复请求
         self._shown: tk.PhotoImage | None = None
         self._canvas_msg = "解析后点某一行看预览"
+        self._canvas_shift = 0
         self._last_out_dir = ""
 
         swiss.apply_theme(self)
@@ -246,16 +248,18 @@ class App(tk.Tk):
         self._tree_wrap = wrap
         self._img_on = _box_image(True)
         self._img_off = _box_image(False)
-        cols = ("type", "label")
+        cols = ("type", "label", "size")
         self.tree = ttk.Treeview(wrap, columns=cols, show="tree headings",
                                  selectmode="browse", height=6,
                                  style="Swiss.Treeview")
         self.tree.heading("#0", text="选")
         self.tree.heading("type", text="类型")
         self.tree.heading("label", text="内容")
+        self.tree.heading("size", text="大小")
         self.tree.column("#0", width=46, anchor="center", stretch=False)
         self.tree.column("type", width=64, anchor="center", stretch=False)
-        self.tree.column("label", width=300, anchor="w")
+        self.tree.column("label", width=280, anchor="w")
+        self.tree.column("size", width=84, anchor="e", stretch=False)
         self.tree.tag_configure("live", foreground=swiss.ACCENT)
         self.tree.tag_configure("audio", foreground=swiss.GREY3)
         # 已选：淡蓝底；未选：文字压灰。两档叠加色块+对勾，隔屏也能看清
@@ -291,6 +295,13 @@ class App(tk.Tk):
                                 bg=swiss.PAPER, bd=0, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=1, pady=1)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # 解析进度条：平时不显示，解析时盖在画布中下部
+        self.parse_bar = ttk.Progressbar(holder, mode="determinate", maximum=100,
+                                         value=0,
+                                         style="Parse.Horizontal.TProgressbar")
+        self._parse_tick = None
+        self._parse_pct = 0.0
 
         # ── 04 OUTPUT
         swiss.hairline(outer, pady=(16, 0), grid_row=3)
@@ -412,7 +423,8 @@ class App(tk.Tk):
             return
 
         self.tree.delete(*self.tree.get_children())
-        self._set_canvas_text("正在解析…")
+        self._set_canvas_text("正在解析…", dy=-18)
+        self._parse_progress(True)
         self.item = None
         self.checked.clear()
         self._set_busy(True)
@@ -440,13 +452,13 @@ class App(tk.Tk):
 
         for i, e in enumerate(item.entries):
             kind = _KIND_LABEL.get(e.kind, e.kind)
-            # 默认勾选：主视频 + 所有图片 + 所有实况（跳过其它清晰度与音频）
+            # 默认勾选：主视频 + 所有图片 + 所有实况（跳过音频）
             if e.kind in ("image", "live"):
                 self.checked.add(i)
             on = i in self.checked
             self.tree.insert("", "end", iid=str(i),
                              image=self._img_on if on else self._img_off, text="",
-                             values=(kind, e.label),
+                             values=(kind, e.label, e.size_text() or "—"),
                              tags=(e.kind, "on" if on else "off"))
         first_video = next((i for i, e in enumerate(item.entries) if e.kind == "video"), None)
         if first_video is not None:
@@ -468,6 +480,37 @@ class App(tk.Tk):
             first = item.entries[0]
             cur = (first.thumb[0] if first.thumb else "") or item.cover or ""
             self._prefetch(item, skip=cur)
+        self._probe_sizes(item)
+
+    def _probe_sizes(self, item: MediaItem) -> None:
+        """清单里不知道大小的条目，后台各问一次（只发 1 个字节的 Range 请求）。
+
+        解析器能直接给出大小的（抖音视频的 `size`）就用现成的，剩下的
+        图片/实况/小红书视频才需要探——解析完立刻显示清单，大小随后填进去。
+        """
+        todo = [(i, e) for i, e in enumerate(item.entries) if e.size <= 0 and e.urls]
+        if not todo:
+            return
+        self._size_token = getattr(self, "_size_token", 0) + 1
+        token = self._size_token
+
+        def one(pair: tuple[int, Entry]) -> tuple[int, int]:
+            idx, entry = pair
+            for url in entry.urls[:2]:
+                n = http.content_length(url)
+                if n > 0:
+                    return idx, n
+            return idx, 0
+
+        def work() -> None:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for idx, n in pool.map(one, todo):
+                    if self._closing or token != self._size_token:
+                        return
+                    if n > 0:
+                        self.q.put(("size", idx, n))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _sync_checks(self) -> None:
         for i in range(len(self.item.entries) if self.item else 0):
@@ -548,16 +591,59 @@ class App(tk.Tk):
         if self._shown is not None:
             self._draw_thumb(self._shown)
         elif self._canvas_msg:
-            self._set_canvas_text(self._canvas_msg)
+            self._set_canvas_text(self._canvas_msg, self._canvas_shift)
 
-    def _set_canvas_text(self, text: str) -> None:
+    def _set_canvas_text(self, text: str, dy: int = 0) -> None:
         self._canvas_msg = text
+        self._canvas_shift = dy
         self._shown = None
         cx, cy = self._canvas_center()
+        cy += dy
         self.canvas.delete("all")
         self.canvas.create_text(cx, cy, text=text, fill=swiss.GREY3, font=swiss.F_SM,
                                 width=max(80, self.canvas.winfo_width() - 24),
                                 justify="center")
+
+    def _parse_progress(self, on: bool) -> None:
+        """解析期间在预览框里显示进度条。
+
+        解析耗时不可预知，所以用「慢速爬升」：最多爬到 90% 停住，
+        解析真正返回时才补到 100% 并收起 —— 不会假装已经完成。
+        """
+        if on:
+            self._parse_pct = 0.0
+            try:
+                self.parse_bar.configure(value=0)
+                self.parse_bar.place(relx=0.5, rely=0.60, anchor="center",
+                                     relwidth=0.56)
+            except tk.TclError:
+                return
+            self._tick_parse()
+        else:
+            if self._parse_tick is not None:
+                try:
+                    self.after_cancel(self._parse_tick)
+                except (tk.TclError, ValueError):
+                    pass
+                self._parse_tick = None
+            try:
+                self.parse_bar.configure(value=100)
+                self.parse_bar.place_forget()
+            except tk.TclError:
+                pass
+
+    def _tick_parse(self) -> None:
+        """让进度条缓慢逼近 90%，越接近越慢。"""
+        self._parse_tick = None
+        if self._parse_pct >= 90:
+            return
+        step = max(0.6, (90 - self._parse_pct) / 14.0)
+        self._parse_pct = min(90.0, self._parse_pct + step)
+        try:
+            self.parse_bar.configure(value=self._parse_pct)
+        except tk.TclError:
+            return
+        self._parse_tick = self.after(110, self._tick_parse)
 
     def _on_tree_select(self, _event=None) -> None:
         sel = self.tree.selection()
@@ -912,9 +998,11 @@ class App(tk.Tk):
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "parsed":
+                    self._parse_progress(False)
                     self._set_busy(False)
                     self._apply_item(msg[1])
                 elif kind == "parse_error":
+                    self._parse_progress(False)
                     self._set_busy(False)
                     self._status("解析失败")
                     messagebox.showerror("解析失败", msg[1])
@@ -939,6 +1027,14 @@ class App(tk.Tk):
                     _, url, ppm = msg
                     if url not in self._thumbs:
                         self._store_thumb(url, ppm)
+                elif kind == "size":
+                    _, idx, nbytes = msg
+                    if self.item and 0 <= idx < len(self.item.entries):
+                        self.item.entries[idx].size = nbytes
+                        try:
+                            self.tree.set(str(idx), "size", human_size(nbytes))
+                        except tk.TclError:
+                            pass
                 elif kind == "done":
                     self._finish_download(msg[1], msg[2])
                 elif kind == "cancelled":

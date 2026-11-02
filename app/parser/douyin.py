@@ -130,6 +130,30 @@ def _gear_label(br: dict) -> str:
     return f"{int(bitrate / 1000)}kbps" if bitrate else "视频"
 
 
+def _gear_rank(br: dict) -> tuple[int, int, int]:
+    """给清晰度排个序：分辨率优先，其次码率、宽度。
+
+    `bit_rate` 字段有时缺失，`gear_name`/`play_addr` 里却写着 720p、1080p，
+    所以三个来源都看一眼。
+    """
+    addr = br.get("play_addr") or {}
+    try:
+        height = int(addr.get("height") or 0)
+        width = int(addr.get("width") or 0)
+        kbps = int(br.get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        height = width = kbps = 0
+    name = str(br.get("gear_name") or "").lower()
+    m = re.search(r"(\d{3,4})\s*p", name)
+    if m:
+        height = max(height, int(m.group(1)))
+    elif "4k" in name:
+        height = max(height, 2160)
+    elif "2k" in name:
+        height = max(height, 1440)
+    return (height, kbps, width)
+
+
 def _build_entries(aweme: dict) -> list[Entry]:
     entries: list[Entry] = []
     video = aweme.get("video") or {}
@@ -138,16 +162,29 @@ def _build_entries(aweme: dict) -> list[Entry]:
     cover = (_url_list(video.get("origin_cover") or video.get("cover"))
              or _url_list(video.get("dynamic_cover")))[:1]
 
-    # 视频：先给默认档，再给各清晰度
+    # 视频：只要一档——优先最高清的那档，其次默认档
+    # （用户要求：不做画质选择，默认就是原画）
     base_urls = _url_list(video.get("play_addr"))
-    if base_urls and not images:
-        entries.append(Entry(label="视频（默认）", kind="video", urls=base_urls, thumb=cover))
-
+    gears = []
     for br in video.get("bit_rate") or []:
         urls = _url_list(br.get("play_addr"))
         if urls:
-            entries.append(Entry(label=f"视频 {_gear_label(br)}", kind="video",
-                                 urls=urls, thumb=cover))
+            gears.append((br, urls))
+    if gears:
+        best_br, best_urls = max(gears, key=lambda g: _gear_rank(g[0]))
+        try:
+            gear_size = int((best_br.get("play_addr") or {}).get("data_size") or 0)
+        except (TypeError, ValueError):
+            gear_size = 0
+        entries.append(Entry(label=f"视频 {_gear_label(best_br)}", kind="video",
+                             urls=best_urls, thumb=cover, size=gear_size))
+    elif base_urls and not images:
+        try:
+            base_size = int((video.get("play_addr") or {}).get("data_size") or 0)
+        except (TypeError, ValueError):
+            base_size = 0
+        entries.append(Entry(label="视频（默认）", kind="video", urls=base_urls,
+                             thumb=cover, size=base_size))
 
     if base_urls and images:
         # 图集作品的 video.play_addr 其实是配乐，单独标出来
@@ -474,20 +511,49 @@ def _third_party_known(data: Any) -> dict | None:
     if not isinstance(d, dict):
         return None
 
-    videos: list[str] = []
+    groups: list[dict] = []      # 每个清晰度一组：{"label": 中文清晰度, "urls": [...]}
     images: list[str] = []
     lives: list[str] = []
     title = author = cover = quality = size = music = ""
     kind = ""
 
+    def _add_group(label: str, urls: list[str]) -> None:
+        """同一清晰度的若干地址（同一份文件的不同镜像）放进同一组。"""
+        cleaned = [u for u in _dedup(urls) if _is_media_url(u)]
+        if cleaned:
+            groups.append({"label": _quality_label(label), "urls": cleaned})
+
+    def _add_backups(value: Any) -> None:
+        """备用链常常是**另一个清晰度**，必须拆成独立条目。
+
+        实测（抖音 aweme 7626111351480663462）：主链是 1080×1920 原画、904333 字节，
+        ``video_backup`` 里那条标着 ``1280p``、807371 字节。早先把两者当成同一组的
+        候选，下载时按速度挑镜像，结果同一个视频两次下载大小会不一样。
+        """
+        if isinstance(value, list):
+            for one in value:
+                if isinstance(one, dict):
+                    _add_group(str(one.get("quality") or one.get("label") or ""),
+                               _as_urls(one.get("url")))
+                else:
+                    _add_group("", _as_urls(one))
+        elif isinstance(value, dict):
+            _add_group(str(value.get("quality") or value.get("label") or ""),
+                       _as_urls(value.get("url")))
+        elif value:
+            _add_group("", _as_urls(value))
+
     # --- bugpk 这类「平铺在 data 上」的结构
-    for key in ("url", "video_url", "video_backup", "nwm_video_url"):
-        videos.extend(_as_urls(d.get(key)))
+    main_urls: list[str] = []
+    for key in ("url", "video_url", "nwm_video_url"):
+        main_urls.extend(_as_urls(d.get(key)))
     for key in ("images", "image_list", "imageList", "image_urls"):
         images.extend(_as_urls(d.get(key)))
     for key in ("live_photo", "livePhoto", "live_photos"):
         lives.extend(_as_urls(d.get(key)))
-    if videos or images or lives:
+    if main_urls or d.get("video_backup") or images or lives:
+        _add_group(str(d.get("quality") or ""), main_urls)
+        _add_backups(d.get("video_backup"))
         title = str(d.get("title") or d.get("desc") or "").strip()
         autor = d.get("author")
         if isinstance(autor, dict):
@@ -505,11 +571,16 @@ def _third_party_known(data: Any) -> dict | None:
 
     # --- xingzhige 这类「item 里套一层」的结构
     it = d.get("item")
-    if not videos and not images and isinstance(it, dict):
-        videos.extend(u for u in (it.get("url"), it.get("ury"), it.get("url_h265"))
-                      if isinstance(u, str) and _is_media_url(u))
+    if not groups and not images and isinstance(it, dict):
+        # ury 是同一清晰度的备用链，跟主链放同一组；h265 版单独一组
+        _add_group(str(it.get("quality") or ""),
+                   [u for u in (it.get("url"), it.get("ury"))
+                    if isinstance(u, str) and _is_media_url(u)])
+        h265 = it.get("url_h265")
+        if isinstance(h265, str) and _is_media_url(h265):
+            _add_group("", [h265])
         images.extend(u for u in _as_urls(it.get("images")) if u.startswith("http"))
-        if videos or images:
+        if groups or images:
             title = str(it.get("title") or "").strip()
             autor = d.get("author")
             if isinstance(autor, dict):
@@ -522,13 +593,30 @@ def _third_party_known(data: Any) -> dict | None:
             if isinstance(jx, dict):
                 kind = str(jx.get("type") or "").strip()
 
-    videos = [u for u in _dedup(videos) if _is_media_url(u)]
+    # 同一份文件可能被不同接口/不同 key 重复给出，按首链去重
+    seen: set[str] = set()
+    uniq_groups: list[dict] = []
+    for g in groups:
+        head = g["urls"][0]
+        if head in seen:
+            continue
+        seen.add(head)
+        uniq_groups.append(g)
+    groups = uniq_groups
+    videos = _dedup([u for g in groups for u in g["urls"]])
     images = _dedup([u for u in images if u.startswith("http")])
     lives = _dedup([u for u in lives if _is_media_url(u)])
     if not videos and not images and not lives:
         return None
+    try:
+        size_bytes = int(d.get("size") or 0)
+    except (TypeError, ValueError):
+        size_bytes = 0
+    if not size_bytes:
+        size_bytes = _parse_size(size)
     return {
         "videos": videos,
+        "video_groups": groups,
         "images": images,
         "lives": lives,
         "title": title,
@@ -537,6 +625,7 @@ def _third_party_known(data: Any) -> dict | None:
         "music": music,
         "quality": quality,
         "size": size,
+        "size_bytes": size_bytes,
         "type": kind,
     }
 
@@ -545,6 +634,43 @@ _QUALITY_ZH = {
     "original": "原画", "origin": "原画", "uhd": "超清", "hd": "高清",
     "sd": "标清", "540p": "540p", "720p": "720p", "1080p": "1080p",
 }
+
+# 「原画」这一档的标签（各家接口写法不同）
+_ORIGINAL_LABELS = ("原画", "原始", "original", "original_video")
+
+_SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?)B?", re.I)
+
+
+def _parse_size(text: str) -> int:
+    """把 "883.14KB" / "1.2 MB" 这类字符串换成字节数，认不出返回 0。"""
+    m = _SIZE_RE.search(text or "")
+    if not m:
+        return 0
+    try:
+        num = float(m.group(1))
+    except ValueError:
+        return 0
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    return int(num * mult.get((m.group(2) or "").upper(), 1))
+
+
+def _pick_original(groups: list[dict]) -> dict | None:
+    """只保留「原画」那一档。
+
+    用户只要原画：接口给的其它清晰度（例如 1280p / 540p）不进清单，
+    免得同一作品出现好几个视频条目、还得手动比较。
+    """
+    if not groups:
+        return None
+    for g in groups:
+        if (g.get("label") or "").strip().lower() in _ORIGINAL_LABELS:
+            return g
+    # 没有「原画」字样时，挑标称分辨率最高的那组
+    def rank(g: dict) -> int:
+        m = re.search(r"(\d{3,4})\s*p", (g.get("label") or ""), re.I)
+        return int(m.group(1)) if m else 0
+
+    return max(groups, key=rank)
 
 
 def _quality_label(raw: str) -> str:
@@ -616,18 +742,22 @@ def _one_third_party(url: str, template: str) -> MediaItem:
     text = raw.decode("utf-8", "replace")
 
     videos: list[str] = []
+    groups: list[dict] = []
     images: list[str] = []
     lives: list[str] = []
     title = author = cover = quality = size = ""
+    size_bytes = 0
     try:
         data = json.loads(text)
         known = _third_party_known(data)
         if known:
             videos = known["videos"]
+            groups = known.get("video_groups") or []
             images = known["images"]
             lives = known["lives"]
             title, author, cover = known["title"], known["author"], known["cover"]
             quality, size = known["quality"], known["size"]
+            size_bytes = known.get("size_bytes") or 0
         else:
             code = data.get("code") if isinstance(data, dict) else None
             msg = data.get("msg") if isinstance(data, dict) else None
@@ -641,14 +771,22 @@ def _one_third_party(url: str, template: str) -> MediaItem:
     except json.JSONDecodeError:
         videos = [m.group(0) for m in _MP4_RE.finditer(text)]
 
+    if not groups and videos:
+        # 认不出清晰度时退化成「一组、按顺序试」
+        groups = [{"label": _quality_label(quality), "urls": videos}]
+    # 只要原画：其它清晰度直接丢掉，清单里不再出现第二个视频条目
+    original = _pick_original(groups)
+    groups = [original] if original else []
+
     if not videos and not images and not lives:
         raise ParseError("没返回可下载地址：\n" + text[:200])
 
     entries: list[Entry] = []
-    if videos:
-        label = "视频" + (f" {_quality_label(quality)}" if quality else "")
-        entries.append(Entry(label=label, kind="video", urls=videos,
-                             thumb=[cover] if cover else []))
+    for g in groups:
+        label = "视频" + (f" {g['label']}" if g.get("label") else "")
+        entries.append(Entry(label=label, kind="video", urls=g["urls"],
+                             thumb=[cover] if cover else [],
+                             size=size_bytes))
     total_img = len(images)
     for i, img in enumerate(images, 1):
         entries.append(Entry(label=f"图片 {i}/{total_img}", kind="image", urls=[img],

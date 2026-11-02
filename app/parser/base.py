@@ -21,9 +21,17 @@ class Entry:
     kind: str                        # video / image / live / audio
     urls: list[str] = field(default_factory=list)   # 候选直链，按优先级尝试
     thumb: list[str] = field(default_factory=list)  # 预览用图片候选
+    size: int = 0                    # 字节数；0 = 未知（界面会自己去问一次）
 
     def is_media(self) -> bool:
         return bool(self.urls) and self.kind in ("video", "image", "live", "audio")
+
+    def size_text(self) -> str:
+        """给界面显示用的大小文字。"""
+        if self.size <= 0:
+            return ""
+        from ..utils import human_size
+        return human_size(self.size)
 
     def describe(self) -> str:
         return {
